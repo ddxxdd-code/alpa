@@ -9,7 +9,7 @@ import traceback
 
 import random
 import torch
-from flask import Flask, request, jsonify
+from flask import Flask, render_template, request, jsonify
 from werkzeug.exceptions import HTTPException
 
 from opt_serving.generator import GeneratorInterface
@@ -19,8 +19,11 @@ from opt_serving.service.utils import encode_fn, build_logger
 from opt_serving.service.workers import WorkItem
 from opt_serving.service.constants import MAX_SEQ_LEN, MAX_BATCH_TOKENS, DEFAULT_PORT, TIMEOUT_MS
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='service')
 BATCH_QUEUE = PriorityQueueRingShard()
+sampling_css = ""
+beam_css = ""
+n_range = 1
 
 logger = build_logger()
 werkzeug_logger = logging.getLogger("werkzeug")
@@ -112,7 +115,7 @@ def batching_loop(timeout=TIMEOUT_MS, max_tokens=MAX_BATCH_TOKENS):
                 continue
 
 
-def worker_main(model_name, path, port):
+def worker_main(model_name, path, port, best_of):
     # disable multithreading in tokenizers and torch, as different Flask threads
     # may then fight for resources.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -123,7 +126,17 @@ def worker_main(model_name, path, port):
     torch.manual_seed(random.randint(1, 20000))
     torch.cuda.manual_seed(random.randint(1, 20000))
 
-    generator = GeneratorInterface(model_name, path)
+    global n_range
+    if best_of > 1:
+        # beam search is on, disable sampling
+        global sampling_css
+        sampling_css = 'display:none'
+        n_range = best_of
+    else:
+        global beam_css
+        beam_css = 'display:none'
+
+    generator = GeneratorInterface(model_name, path, best_of=best_of)
 
     thread = threading.Thread(target=batching_loop, daemon=True)
     thread.start()
@@ -136,15 +149,13 @@ def handle_exception(e):
     if isinstance(e, HTTPException):
         return e
     # now you're handling non-HTTP exceptions only
-    response = jsonify(
-        {
-            "error": {
-                "message": str(e),
-                "type": "oops",
-                # "stacktrace": traceback.format_tb(e.__traceback__),
-            }
+    response = jsonify({
+        "error": {
+            "message": str(e),
+            "type": "oops",
+            # "stacktrace": traceback.format_tb(e.__traceback__),
         }
-    )
+    })
     if isinstance(e, ValueError):
         response.status = 400
     else:
@@ -229,9 +240,13 @@ def completions(engine=None):
 
 @app.route("/")
 def index():
-    fn = "./service/index.html"
-    with open(fn) as f:
-        return f.read()
+    global sampling_css
+    global beam_css
+    global n_range
+    return render_template('index.html',
+                           sampling_css=sampling_css,
+                           beam_css=beam_css,
+                           n_range=n_range)
 
 
 if __name__ == "__main__":
@@ -239,6 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="alpa/opt-125m")
     parser.add_argument("--path", type=str, default="/home/ubuntu/opt_weights/")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--best_of", type=int, default=1)
     args = parser.parse_args()
 
-    worker_main(args.model, args.path, args.port)
+    worker_main(args.model, args.path, args.port, args.best_of)
